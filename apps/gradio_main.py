@@ -14,13 +14,14 @@ import soundfile as sf
 import tempfile
 from vieneu import Vieneu
 import os
+import re
 import time
 import numpy as np
 import queue
 import threading
 import yaml
 import uuid
-from vieneu_utils.core_utils import join_audio_chunks, env_bool, get_silence_duration_v2, gaps_to_silence, trust_remote_code_enabled
+from vieneu_utils.core_utils import join_audio_chunks, env_bool, get_silence_duration_v2, gaps_to_silence, trust_remote_code_enabled, pause_pad_samples
 from vieneu_utils.phonemize_text import phonemize_to_chunks, normalize_to_chunks, normalize_to_chunks_v3, normalize_to_chunks_v3_with_gaps
 # PuncNormalizer = sea_g2p.Normalizer luôn bật punc_norm=True.
 from vieneu_utils.phonemize_text import PuncNormalizer as Normalizer
@@ -877,6 +878,66 @@ def resolve_voice_id(v_id: str) -> str:
 # (speaker embedding + ref codes) nên mọi lần sinh đều là giọng tự nhiên.
 
 
+# --- SRT export (Đọc truyện / Voice Cloning, v3) ---------------------------------
+# Cue list of the LAST finished generation: [(start_s, end_s, text), ...]
+_LAST_SRT_CUES: list = []
+
+
+def _sentence_case(t: str) -> str:
+    """The model lower-cases text when normalising; restore capitals at sentence starts."""
+    return re.sub(r"(^|[.!?…]\s+)([^\W\d_])", lambda m: m.group(1) + m.group(2).upper(), t)
+
+
+def _record_srt_cues(chunk_texts, chunk_wavs, sr, silence_ps):
+    """Compute exact subtitle times from the real chunk lengths, mirroring the
+    padding rule of ``join_audio_chunks(..., silence_ps=...)`` so the SRT matches
+    the audio file sample for sample."""
+    _LAST_SRT_CUES.clear()
+    pos = 0
+    for i, (txt, w) in enumerate(zip(chunk_texts, chunk_wavs)):
+        n = len(w)
+        if i > 0:
+            pause_s = silence_ps[i - 1] if i - 1 < len(silence_ps) else 0.0
+            pos += pause_pad_samples(chunk_wavs[i - 1], w, sr, pause_s)
+        if n > 0 and str(txt).strip():
+            # One subtitle per sentence: chunk start/end are exact; inside a chunk the
+            # time is shared between its sentences in proportion to their length.
+            sents = [x for x in re.split(r"(?<=[.!?…])\s+", str(txt).strip()) if x.strip()]
+            weights = [max(1, len(re.sub(r"\W", "", x))) for x in sents]
+            total_w = float(sum(weights))
+            t0 = pos / sr
+            dur = n / sr
+            acc = 0.0
+            for x, w in zip(sents, weights):
+                a = t0 + dur * acc / total_w
+                acc += w
+                b = t0 + dur * acc / total_w
+                _LAST_SRT_CUES.append((a, b, _sentence_case(x.strip())))
+        pos += n
+
+
+def _fmt_srt_time(seconds: float) -> str:
+    ms = int(round(seconds * 1000))
+    h, ms = divmod(ms, 3_600_000)
+    m, ms = divmod(ms, 60_000)
+    sec, ms = divmod(ms, 1000)
+    return f"{h:02d}:{m:02d}:{sec:02d},{ms:03d}"
+
+
+def build_srt_file(want_srt: bool):
+    """Gradio handler: write the last generation's cues to a .srt file and reveal
+    the download button (only when the 'Xuất phụ đề' checkbox is ticked)."""
+    if not want_srt or not _LAST_SRT_CUES:
+        return gr.update(visible=False)
+    blocks = [
+        f"{i}\n{_fmt_srt_time(a)} --> {_fmt_srt_time(b)}\n{t}\n"
+        for i, (a, b, t) in enumerate(_LAST_SRT_CUES, 1)
+    ]
+    with tempfile.NamedTemporaryFile("w", delete=False, suffix=".srt", encoding="utf-8") as f:
+        f.write("\n".join(blocks))
+    return gr.update(value=f.name, visible=True)
+
+
 def synthesize_speech(text: str, voice_choice: str, custom_audio, custom_text: str,
                       mode_tab: str, generation_mode: str, use_batch: bool, max_batch_size_run: int,
                       temperature: float, max_chars_chunk: int,
@@ -885,6 +946,7 @@ def synthesize_speech(text: str, voice_choice: str, custom_audio, custom_text: s
     global tts, current_backbone, current_codec, model_loaded, using_lmdeploy
     
     _STOP_EVENT.clear()  # Reset for new generation
+    _LAST_SRT_CUES.clear()
     
     if not model_loaded or tts is None:
         yield None, "⚠️ Vui lòng tải model trước!"
@@ -1052,6 +1114,7 @@ def synthesize_speech(text: str, voice_choice: str, custom_audio, custom_text: s
             if wav is None or len(wav) == 0:
                 yield None, "❌ Không sinh được audio nào."
                 return
+            _record_srt_cues(v3_chunks, v3_wavs, sr_v3, gaps_to_silence(v3_gaps))
             with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
                 sf.write(tmp.name, wav, sr_v3)
                 out_path_v3 = tmp.name
@@ -2221,6 +2284,11 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo
             
             # --- OUTPUT ---
             with gr.Column(scale=2):
+                make_srt = gr.Checkbox(
+                    label="📝 Xuất kèm phụ đề .srt (có mốc thời gian)",
+                    value=False,
+                    info="Tích trước khi bấm tạo. Áp dụng cho tab Đọc truyện và Voice Cloning (v3).",
+                )
                 audio_output = gr.Audio(
                     label="Kết quả",
                     type="filepath",
@@ -2242,6 +2310,11 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo
                         max_lines=4,
                         show_copy_button=True
                     )
+                srt_download_btn = gr.DownloadButton(
+                    "📝 Tải xuống file phụ đề .srt",
+                    variant="secondary",
+                    visible=False,
+                )
                 download_btn = gr.DownloadButton(
                     "📥 Tải xuống file Audio",
                     variant="primary",
@@ -2542,6 +2615,12 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo
         # Handler: set stop event + update UI
         # Note: We avoid cancels= here to prevent internal Gradio KeyError crashes,
         # relying instead on the frequent _STOP_EVENT.is_set() checks in the code.
+        # SRT export: hide stale button on each run, build the file after generation.
+        for _btn in (btn_generate, btn_generate_clone):
+            _btn.click(lambda: gr.update(visible=False), outputs=[srt_download_btn])
+        gen_event.then(build_srt_file, inputs=[make_srt], outputs=[srt_download_btn])
+        clone_gen_event.then(build_srt_file, inputs=[make_srt], outputs=[srt_download_btn])
+
         btn_stop.click(fn=request_stop, outputs=[audio_output, status_output, estimate_output, btn_stop])
 
         # --- Download Button Event Handlers ---
